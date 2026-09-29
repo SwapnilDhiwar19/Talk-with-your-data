@@ -24,8 +24,8 @@ if not GEMINI_API_KEY:
 client = genai.Client(api_key=GEMINI_API_KEY)
 
 # Valid Gemini model names
-PRIMARY_MODEL = "gemini-2.5-flash"
-FALLBACK_MODEL = "gemini-2.5-pro"
+PRIMARY_MODEL = "gemini-3.8-flash"
+FALLBACK_MODEL = "gemini-3.1-pro-preview"
 
 def generate_content_with_retry(client_obj, prompt_text, max_retries=3):
     """Executes prompt with backoff retries and model failover against transient capacity spikes."""
