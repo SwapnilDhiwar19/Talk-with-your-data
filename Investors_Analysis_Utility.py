@@ -23,7 +23,7 @@ if not GEMINI_API_KEY:
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
-PRIMARY_MODEL = "gemini-3.5-flash-lite"
+PRIMARY_MODEL = "gemini-3-flash-preview"
 FALLBACK_MODEL = "gemini-3.1-pro"
 
 def generate_content_with_retry(client_obj, prompt_text, max_retries=3):
