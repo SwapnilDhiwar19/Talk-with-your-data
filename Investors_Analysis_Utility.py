@@ -3,8 +3,9 @@ import pandas as pd
 import json
 import os
 import time
-from google import genai
+import random
 from datetime import datetime
+from google import genai
 
 # --- 1. CONFIGURATION & MODEL SETUP ---
 st.set_page_config(
@@ -23,15 +24,17 @@ if not GEMINI_API_KEY:
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
+# Prioritize the responsive preview/flash models with fallback
 PRIMARY_MODEL = "gemini-3-flash-preview"
-FALLBACK_MODEL = "gemini-3.1-pro"
+FALLBACK_MODEL = "gemini-2.0-flash"
 
-def generate_content_with_retry(client_obj, prompt_text, max_retries=3):
-    """Executes prompt with backoff retries and model failover against 503 capacity spikes."""
+def generate_content_with_retry(client_obj, prompt_text, max_retries_per_model=3):
+    """Executes prompt with dynamic retry backoff and multi-model failover."""
     models_to_try = [PRIMARY_MODEL, FALLBACK_MODEL]
+    last_err = None
     
     for model_name in models_to_try:
-        for attempt in range(max_retries):
+        for attempt in range(max_retries_per_model):
             try:
                 res = client_obj.models.generate_content(
                     model=model_name,
@@ -40,14 +43,18 @@ def generate_content_with_retry(client_obj, prompt_text, max_retries=3):
                 )
                 return res
             except Exception as e:
+                last_err = e
                 err_str = str(e)
-                if "503" in err_str or "UNAVAILABLE" in err_str or "429" in err_str:
-                    wait_seconds = (attempt + 1) * 2
+                
+                # Check for transient capacity or quota spikes
+                if any(code in err_str for code in ["503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED"]):
+                    wait_seconds = (2 ** attempt) * 2 + random.uniform(0.5, 1.0)
                     time.sleep(wait_seconds)
                     continue
+                # For non-transient errors (404, 400), switch directly to fallback model
                 break
                 
-    raise Exception("Google AI servers are currently experiencing high demand. Please try again in a few seconds.")
+    raise RuntimeError(f"Service temporarily saturated across all candidate models. Root cause: {last_err}")
 
 # --- 2. THEME (HDFC-inspired: deep blue + red, on white) ---
 HDFC_BLUE = "#004C8F"
@@ -175,8 +182,8 @@ uploaded_file = st.file_uploader(" ", type=["csv", "xlsx", "xls"], label_visibil
 
 if uploaded_file is None:
     st.markdown('<div class="footer-note">Upload an Excel or CSV file to start analysis</div>', unsafe_allow_html=True)
-
-if uploaded_file is not None:
+else:
+    df = None
     try:
         file_ext = uploaded_file.name.split('.')[-1].lower()
         if file_ext == 'csv':
@@ -187,50 +194,52 @@ if uploaded_file is not None:
             except Exception:
                 uploaded_file.seek(0)
                 df = pd.read_excel(uploaded_file)
+    except Exception as e:
+        st.error(f"Error reading file '{uploaded_file.name}': {e}")
+        st.stop()
 
-        st.success(f"✅ Data loaded: **{uploaded_file.name}** ({len(df):,} records, {len(df.columns)} columns)")
+    st.success(f"✅ Data loaded: **{uploaded_file.name}** ({len(df):,} records, {len(df.columns)} columns)")
 
-        tab_ask, tab_history = st.tabs(["Ask the Assistant", "Query History"])
+    tab_ask, tab_history = st.tabs(["Ask the Assistant", "Query History"])
 
-        with tab_ask:
-            st.caption("Try: *'Disbursement breakdown across zones'* or *'Delinquency rates across ticket sizes'*")
-            query = st.text_input("Your question", label_visibility="collapsed", placeholder="Enter your business question...")
-            
-            run = False
-            _, btn_col, _ = st.columns([2, 1, 2])
-            with btn_col:
-                run = st.button("Analyze", use_container_width=True)
+    with tab_ask:
+        st.caption("Try: *'Disbursement breakdown across zones'* or *'Delinquency rates across ticket sizes'*")
+        query = st.text_input("Your question", label_visibility="collapsed", placeholder="Enter your business question...")
+        
+        run = False
+        _, btn_col, _ = st.columns([2, 1, 2])
+        with btn_col:
+            run = st.button("Analyze", use_container_width=True)
 
-            if run and query:
-                with st.spinner("Crunching numbers, compiling cross-tabs, and rendering charts..."):
-                    col_summary = "\n".join([f"- {col} ({dtype})" for col, dtype in zip(df.columns, df.dtypes)])
-                    num_summary = df.describe().to_string()
+        if run and query:
+            with st.spinner("Crunching numbers, compiling cross-tabs, and rendering charts..."):
+                try:
+                    # Provide schema and a compact sample preview to avoid huge token payloads
+                    col_summary = ", ".join([f"{col} ({dtype})" for col, dtype in zip(df.columns, df.dtypes)])
+                    sample_summary = df.head(3).to_dict(orient="records")
 
                     prompt = f"""
                     You are a Lead BIU / MIS Banking Analyst.
-                    A pandas DataFrame 'df' is loaded in memory with these columns and types:
-                    {col_summary}
-
-                    Summary statistics preview:
-                    {num_summary}
+                    A pandas DataFrame 'df' is loaded in memory.
+                    Columns & Data Types: {col_summary}
+                    First 3 Sample Records: {json.dumps(sample_summary, default=str)}
 
                     BUSINESS QUESTION: "{query}"
 
                     CRITICAL REQUIREMENTS:
-                    1. Cross-Tab & Visuals: The executable code MUST ALWAYS output BOTH:
+                    1. Cross-Tab & Visuals: The executable code MUST ALWAYS output:
                        - An aggregated cross-tab or pivot table using `st.dataframe(...)` or `st.table(...)`.
-                       - A primary visual chart using `st.bar_chart(...)` or `st.line_chart(...)`.
+                       - A chart using `st.bar_chart(...)` or `st.line_chart(...)`.
                     2. Deep Analytical Writeup:
-                       - Explicitly discuss concrete numerical points, baseline averages, and percentage variances.
-                       - Highlight the core trends and drivers behind the numbers.
+                       - Discuss concrete trends, averages, and variances.
                     3. Caveats & Self-Analysis:
-                       - Mention sample skews, outliers, zero-value concentrations, or missing slices that readers should consider before making credit/business decisions.
+                       - Note statistical biases, missing dimensions, or concentration risks.
 
-                    Respond ONLY with a valid JSON object (no markdown, no backticks) containing:
+                    Respond ONLY with a valid JSON object (no markdown outside the JSON, no backticks):
                     {{
-                        "executive_summary": "Thorough 3-5 sentence breakdown referencing numbers, percentages, and direction of trends.",
+                        "executive_summary": "Thorough 3-5 sentence breakdown referencing numbers and directions.",
                         "caveats_and_risks": "2-3 sentences covering data caveats, concentration risks, or statistical biases.",
-                        "code": "Valid Python code using Streamlit to compute and display BOTH the cross-tab/pivot and chart."
+                        "code": "Valid Python code using Streamlit ('st') and pandas ('pd') to compute and display BOTH the cross-tab/pivot and chart."
                     }}
                     """
 
@@ -280,23 +289,24 @@ if uploaded_file is not None:
                     with result_container:
                         st.subheader("Data & Visual Output")
                         try:
-                            exec(clean_code)
+                            # Pass df, pd, and st explicitly into the exec execution context
+                            exec(clean_code, {"df": df, "pd": pd, "st": st})
                         except Exception as err:
                             st.error(f"Execution Error: {err}")
                             with st.expander("View generated code"):
                                 st.code(clean_code, language="python")
 
-        with tab_history:
-            if not st.session_state.history:
-                st.info("No queries executed in this session.")
-            else:
-                for item in reversed(st.session_state.history):
-                    st.markdown(f"""
-                    <div style="background-color: #f8f9fa; border-left: 3px solid {HDFC_BLUE}; padding: 0.6rem 1rem; border-radius: 6px; margin-bottom: 0.8rem;">
-                        <strong>🕒 {item['time']} — {item['query']}</strong>
-                        <p style="margin: 0.4rem 0 0 0; font-size: 0.88rem; color: #3c4043;">{item['summary']}</p>
-                    </div>
-                    """, unsafe_allow_html=True)
+                except Exception as api_err:
+                    st.error(f"Analysis Generation Error: {api_err}")
 
-    except Exception as e:
-        st.error(f"Error reading file: {e}")
+    with tab_history:
+        if not st.session_state.history:
+            st.info("No queries executed in this session.")
+        else:
+            for item in reversed(st.session_state.history):
+                st.markdown(f"""
+                <div style="background-color: #f8f9fa; border-left: 3px solid {HDFC_BLUE}; padding: 0.6rem 1rem; border-radius: 6px; margin-bottom: 0.8rem;">
+                    <strong>🕒 {item['time']} — {item['query']}</strong>
+                    <p style="margin: 0.4rem 0 0 0; font-size: 0.88rem; color: #3c4043;">{item['summary']}</p>
+                </div>
+                """, unsafe_allow_html=True)
